@@ -22,6 +22,8 @@ export class FirebaseNetworkManager {
     this.roomId = null;
     this.myPlayerId = null;
     this.lastProcessedBatchId = 0;
+    this.unsubRoom = null;
+    this.unsubQueue = null;
     this.onStateSync = onStateSyncCallback;
     this.onPlayerAction = onPlayerActionCallback;
     this.onReady = onReadyCallback || (() => {});
@@ -53,8 +55,9 @@ export class FirebaseNetworkManager {
     let myId = saved?.roomId === code ? saved.myPlayerId : null;
 
     if (!myId) {
-      if (existingPlayers.length >= 4) {
-        this.onError('Phòng đã đủ 4 người!');
+      const maxAllowed = roomData.state?.boardPreset === 'MEGA_52' ? 6 : 6;
+      if (existingPlayers.length >= maxAllowed) {
+        this.onError(`Phòng đã đủ ${maxAllowed} người!`);
         return;
       }
       myId = `P${existingPlayers.length + 1}`;
@@ -86,7 +89,7 @@ export class FirebaseNetworkManager {
       }
 
       const actionQueueRef = ref(this.db, `rooms/${this.roomId}/actionQueue`);
-      onChildAdded(actionQueueRef, (snapshot) => {
+      this.unsubQueue = onChildAdded(actionQueueRef, (snapshot) => {
         const cmd = snapshot.val();
         if (cmd) {
           this.onPlayerAction(cmd.playerId, cmd.action, cmd.payload);
@@ -95,7 +98,7 @@ export class FirebaseNetworkManager {
       });
     }
 
-    onValue(roomRef, (snapshot) => {
+    this.unsubRoom = onValue(roomRef, (snapshot) => {
       const data = snapshot.val();
       if (!data || !data.state) return;
 
@@ -131,6 +134,22 @@ export class FirebaseNetworkManager {
       batchId: nextBatchId,
       events
     });
+  }
+
+  disconnect() {
+    try {
+      this.unsubRoom?.();
+      this.unsubQueue?.();
+    } catch {
+      // Bỏ qua lỗi hủy lắng nghe
+    }
+    this.unsubRoom = null;
+    this.unsubQueue = null;
+    this.isHost = false;
+    this.roomId = null;
+    this.myPlayerId = null;
+    this.lastProcessedBatchId = 0;
+    sessionStorage.removeItem('ctp_fb_session');
   }
 
   saveSession(roomId, myPlayerId, isHost) {

@@ -69,4 +69,14 @@ export class NetworkAdapter {
       this.driver.broadcastState(events, updatedGameState);
     }
   }
+
+  leaveRoom() {
+    if (this.driver) {
+      this.driver.disconnect?.();
+      this.driver = null;
+    }
+    this.mode = 'NONE';
+    this.isHost = false;
+    this.onContextUpdate({ mode: 'NONE', roomId: null, myPlayerId: null, isHost: false });
+  }
 }

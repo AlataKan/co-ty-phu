@@ -42,13 +42,13 @@ export class PeerNetworkManager {
 
     this.peer.on('connection', (conn) => {
       conn.on('open', () => {
-        if (this.connections.size >= 3) {
-          conn.send({ type: 'ERROR', message: 'Phòng đã đủ 4 người!' });
+        if (this.connections.size >= 5) {
+          conn.send({ type: 'ERROR', message: 'Phòng đã đủ tối đa 6 người!' });
           setTimeout(() => conn.close(), 500);
           return;
         }
 
-        const slots = ['P2', 'P3', 'P4'];
+        const slots = ['P2', 'P3', 'P4', 'P5', 'P6'];
         const assignedId = slots.find(id => !this.connections.has(id)) || `P${this.connections.size + 2}`;
         this.connections.set(assignedId, conn);
 
@@ -60,6 +60,7 @@ export class PeerNetworkManager {
 
         conn.on('close', () => {
           this.connections.delete(assignedId);
+          this.onPlayerAction(assignedId, 'LEAVE_ROOM', {});
         });
       });
     });
@@ -75,6 +76,13 @@ export class PeerNetworkManager {
 
       this.hostConnection.on('open', () => {
         this.sendAction('JOIN_GAME', { name: playerName });
+      });
+
+      this.hostConnection.on('close', () => {
+        if (this.hostConnection) {
+          this.hostConnection = null;
+          this.onError('Kết nối tới Chủ phòng đã đóng!');
+        }
       });
 
       this.hostConnection.on('data', (data) => {
@@ -108,6 +116,28 @@ export class PeerNetworkManager {
         payload
       });
     }
+  }
+
+  disconnect() {
+    try {
+      if (this.hostConnection) {
+        this.hostConnection.close();
+        this.hostConnection = null;
+      }
+      for (const conn of this.connections.values()) {
+        conn.close();
+      }
+      this.connections.clear();
+      if (this.peer) {
+        this.peer.destroy();
+        this.peer = null;
+      }
+    } catch {
+      // Bỏ qua lỗi khi đóng kết nối
+    }
+    this.isHost = false;
+    this.roomId = null;
+    this.myPlayerId = null;
   }
 
   broadcastState(events, updatedGameState) {

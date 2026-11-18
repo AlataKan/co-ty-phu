@@ -3,20 +3,20 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cờ Tỷ Phú Việt Nam - 2D Multiplayer</title>
+    <title>Cờ Tỷ Phú Việt Nam 3D - Sa Bàn Địa Danh &amp; Di Sản</title>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
-      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@600;700&family=Montserrat:wght@500;600;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@500;600;700;800;900&family=JetBrains+Mono:wght@600;700;800&display=swap"
       rel="stylesheet"
     />
   </head>
-  <body class="bg-slate-950 text-slate-100 overflow-hidden select-none w-screen h-screen relative">
-    <!-- Lớp Dưới: Phaser 3 Canvas (Z-index: 1) -->
-    <div id="phaser-board-canvas" class="absolute inset-0 z-[1] flex items-center justify-center"></div>
+  <body class="relative select-none w-screen h-screen overflow-hidden">
+    <!-- Lớp Dưới: Không gian Sa Bàn 3D Trung Tâm (Z-index: 1) -->
+    <div id="board-3d-root" class="absolute inset-0 z-[1]"></div>
 
-    <!-- Lớp Trên: HTML5 + Tailwind DOM Overlay (Z-index: 10) -->
-    <div id="dom-ui-overlay" class="absolute inset-0 z-[10] pointer-events-none"></div>
+    <!-- Lớp Trên: Compact HUD, Thẻ Sổ Đỏ, Event Popup & Modals (Z-index: 20) -->
+    <div id="dom-ui-overlay" class="absolute inset-0 z-[20] pointer-events-none"></div>
 
     <script type="module" src="/src/main.js"></script>
   </body>

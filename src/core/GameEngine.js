@@ -1,67 +1,174 @@
 import { createFreshBoard, PLAYER_PRESETS, GAME_CONSTANTS } from '../data/boardData.js';
+import { MEGA_52_CONSTANTS, ALLIANCE_TEAMS, getAllianceForPlayer } from '../data/boardData52.js';
 import { CHANCE_CARDS, COMMUNITY_CARDS, shuffleDeck } from '../data/cardDecks.js';
+import {
+  areTeammates,
+  ownsFullGroupUnmortgaged,
+  canBuildHouseState,
+  canSellHouseState,
+  canMortgageTileState,
+  isTileTradableState,
+  getStationRentByCount,
+  getUtilityMultiplierByCount,
+  getTransitTeleportInfo,
+  getAllyBailoutInfo,
+  calculateNetWorthState
+} from './stateRules.js';
+
+const SPEED_DIE_FACES = [1, 2, 3, 'BUS', 'BUS', 'MR_MONOPOLY'];
 
 export class GameEngine {
-  constructor(roomId = 'LOCAL', mode = 'CLASSIC') {
+  constructor(roomId = 'LOCAL', mode = 'CLASSIC', options = {}) {
     this.chanceDeck = shuffleDeck(CHANCE_CARDS);
     this.communityDeck = shuffleDeck(COMMUNITY_CARDS);
     this.auctionTimer = null;
-    this.onBroadcast = null; // Callback (events, state) => void gắn với NetworkManager
+    this.onBroadcast = null;
+
+    const boardPreset = options.boardPreset === 'MEGA_52' ? 'MEGA_52' : 'STANDARD_40';
+    const allianceMode = boardPreset === 'MEGA_52' ? Boolean(options.allianceMode) : false;
 
     this.state = {
       roomId,
       mode, // 'CLASSIC' | 'SPEED'
+      boardPreset, // 'STANDARD_40' | 'MEGA_52'
+      allianceMode, // true = Liên Minh 2v2v2
       startedAt: null,
-      phase: 'LOBBY', // LOBBY | TURN_START | JAIL_DECISION | ROLL_DICE | TILE_RESOLUTION | AUCTION_PHASE | MANAGEMENT_PHASE | BANKRUPTCY_CHECK | GAME_OVER
+      roundCount: 1,
+      phase: 'LOBBY', // LOBBY | JAIL_DECISION | ROLL_DICE | TILE_RESOLUTION | BUS_DECISION | AUCTION_PHASE | MANAGEMENT_PHASE | BANKRUPTCY_CHECK | GAME_OVER
       players: [],
       activePlayerIndex: 0,
-      board: createFreshBoard(),
+      board: createFreshBoard(boardPreset),
       dice: [1, 1],
+      speedDie: null, // null | 1 | 2 | 3 | 'BUS' | 'MR_MONOPOLY'
+      pendingSpeedAction: null,
+      busTargets: null, // { cardIndex, stationIndex }
       doubleCount: 0,
       escapedJailByDouble: false,
-      pendingDebtCreditor: null, // 'BANK' hoặc playerId
-      auctionQueue: [],          // Hàng đợi các lô đất cần đấu giá (khi phá sản cho Ngân hàng)
-      auction: null,             // { tileIndex, highestBid, highestBidderId, foldedIds, expiresAt }
-      pendingTrade: null,        // Đề nghị giao dịch đang chờ phản hồi
-      pendingMortgageTransfers: [], // Các lô đất thế chấp vừa nhận từ giao dịch cần chọn giải chấp/giữ nguyên
+      festivalFund: 0,
+      pendingDebtCreditor: null,
+      auctionQueue: [],
+      auction: null,
+      pendingTrade: null,
+      pendingMortgageTransfers: [],
       winnerId: null,
+      winningAlliance: null,
       logs: ['Phòng chờ đã sẵn sàng.']
     };
   }
 
-  // Thêm người chơi vào phòng chờ (tối đa 4 người)
+  getBoardSize() {
+    return this.state.board.length;
+  }
+
+  getJailIndex() {
+    return this.state.boardPreset === 'MEGA_52' ? MEGA_52_CONSTANTS.JAIL_INDEX : 10;
+  }
+
+  getInitialBalance() {
+    return this.state.boardPreset === 'MEGA_52'
+      ? MEGA_52_CONSTANTS.INITIAL_BALANCE
+      : GAME_CONSTANTS.INITIAL_BALANCE;
+  }
+
+  // Cấu hình bàn cờ 40 ô / 52 ô & chế độ Liên minh 2v2v2 ngay tại Phòng chờ
+  setLobbyConfig({ boardPreset, allianceMode, mode } = {}) {
+    if (this.state.phase !== 'LOBBY') return;
+
+    if (mode === 'CLASSIC' || mode === 'SPEED') {
+      this.state.mode = mode;
+    }
+
+    if (boardPreset && (boardPreset === 'STANDARD_40' || boardPreset === 'MEGA_52')) {
+      if (boardPreset === 'STANDARD_40' && this.state.players.length > 4) {
+        // Chỉ cắt bớt nếu ghế 5-6 là AI Bot; nếu là người thật thì giữ nguyên bản 52 ô
+        const extraPlayers = this.state.players.slice(4);
+        if (extraPlayers.every(p => p.isAI)) {
+          this.state.players = this.state.players.slice(0, 4);
+        } else {
+          this.log('⚠️ Đang có trên 4 người chơi thật nên giữ nguyên bàn cờ Mở Rộng 52 Ô.');
+          boardPreset = 'MEGA_52';
+        }
+      }
+
+      if (this.state.boardPreset !== boardPreset) {
+        this.state.boardPreset = boardPreset;
+        this.state.board = createFreshBoard(boardPreset);
+        const startCash = this.getInitialBalance();
+        this.state.players.forEach(p => {
+          p.cash = startCash;
+          p.position = 0;
+        });
+        this.log(
+          boardPreset === 'MEGA_52'
+            ? '🔥 Đã chuyển sang Bàn cờ Đại Chiến Lục Hùng 52 Ô (Tối đa 6 người • Vốn 2500K)!'
+            : '🗺️ Đã chuyển về Bàn cờ Tiêu Chuẩn 40 Ô (Tối đa 4 người • Vốn 2000K).'
+        );
+      }
+    }
+
+    if (allianceMode !== undefined) {
+      this.state.allianceMode = this.state.boardPreset === 'MEGA_52' ? Boolean(allianceMode) : false;
+    }
+  }
+
+  // Thêm người chơi vào phòng chờ (tối đa 6 người)
   addPlayer(id, name, isAI = false) {
-    if (this.state.phase !== 'LOBBY' || this.state.players.length >= 4) return false;
+    if (this.state.phase !== 'LOBBY' || this.state.players.length >= 6) return false;
     const existing = this.state.players.find(p => p.id === id);
     if (existing) {
       existing.name = name || existing.name;
       return true;
     }
+
+    // Tự động nâng cấp lên bàn cờ 52 ô nếu thêm người chơi thứ 5 hoặc thứ 6
+    if (this.state.players.length >= 4 && this.state.boardPreset !== 'MEGA_52') {
+      this.setLobbyConfig({ boardPreset: 'MEGA_52' });
+    }
+
     const preset = PLAYER_PRESETS[this.state.players.length];
     this.state.players.push({
       id: id || preset.id,
+      short: preset.short || id || preset.id,
       name: name || preset.defaultName,
       color: preset.color,
+      icon: preset.icon || '⭐',
       avatar: preset.avatar,
-      cash: GAME_CONSTANTS.INITIAL_BALANCE,
+      cash: this.getInitialBalance(),
       position: 0,
       inJail: false,
       jailTurns: 0,
       jailFreeCards: 0,
+      usedBailout: false,
       isBankrupt: false,
       isAI
     });
-    this.log(`👋 ${name || preset.defaultName} đã tham gia phòng.`);
+    this.log(`👋 ${name || preset.defaultName} (${preset.icon}) đã tham gia phòng.`);
     return true;
   }
 
-  startGame(mode = 'CLASSIC') {
+  startGame(mode = this.state.mode, extraConfig = {}) {
+    if (extraConfig.boardPreset !== undefined || extraConfig.allianceMode !== undefined) {
+      this.setLobbyConfig(extraConfig);
+    }
     if (this.state.players.length < 2) return { events: [], state: this.getSnapshot() };
-    this.state.mode = mode;
+
+    // Liên minh 2v2v2 tối ưu khi có từ 4-6 người; nếu chỉ có 2 người thì tắt để tránh 2 người cùng đội hoặc lệch
+    if (this.state.allianceMode && this.state.players.length < 4) {
+      this.state.allianceMode = false;
+    }
+
+    this.state.mode = mode || this.state.mode;
     this.state.startedAt = Date.now();
+    this.state.roundCount = 1;
     this.state.activePlayerIndex = 0;
     this.state.doubleCount = 0;
-    this.log(`🎲 Ván đấu bắt đầu! Chế độ: ${mode === 'SPEED' ? 'Chơi nhanh 45 phút' : 'Tiêu chuẩn'}.`);
+    this.state.speedDie = null;
+    this.state.pendingSpeedAction = null;
+    this.state.busTargets = null;
+
+    const mapLabel = this.state.boardPreset === 'MEGA_52' ? 'Đại Chiến 52 Ô' : 'Tiêu Chuẩn 40 Ô';
+    const teamLabel = this.state.allianceMode ? ' • Liên Minh 2v2v2' : '';
+    this.log(`🎲 Ván đấu bắt đầu! [${mapLabel}${teamLabel} • ${this.state.mode === 'SPEED' ? '45 Phút' : 'Đến người cuối'}].`);
     this.enterTurnStart();
     return { events: [], state: this.getSnapshot() };
   }
@@ -75,14 +182,29 @@ export class GameEngine {
       return this.emit(events);
     }
 
+    if (action === 'REMOVE_PLAYER' && playerId === 'P1' && this.state.phase === 'LOBBY') {
+      this.removeLobbyPlayer(payload.targetId);
+      return this.emit(events);
+    }
+
+    if (action === 'LEAVE_ROOM') {
+      this.handleLeaveRoom(playerId, events);
+      return this.emit(events);
+    }
+
+    if (action === 'SET_LOBBY_CONFIG' && playerId === 'P1') {
+      this.setLobbyConfig(payload);
+      return this.emit(events);
+    }
+
     if (action === 'START_GAME' && playerId === 'P1') {
-      this.startGame(payload.mode || this.state.mode);
+      this.startGame(payload.mode || this.state.mode, payload);
       return this.emit(events);
     }
 
     if (this.state.phase === 'GAME_OVER') return this.emit(events);
 
-    // Các hành động toàn cục không giới hạn người giữ lượt (Đấu giá & Phản hồi Giao dịch)
+    // Các hành động toàn cục (Đấu giá, Phản hồi Giao dịch, Giải chấp chuyển nhượng, Cứu trợ Liên minh)
     if (this.state.phase === 'AUCTION_PHASE') {
       if (action === 'PLACE_BID') this.handlePlaceBid(playerId, payload.amount, events);
       if (action === 'FOLD_AUCTION') this.handleFoldAuction(playerId, events);
@@ -99,6 +221,11 @@ export class GameEngine {
       return this.emit(events);
     }
 
+    if (action === 'ALLY_BAILOUT' && this.state.phase === 'BANKRUPTCY_CHECK') {
+      this.handleAllyBailout(playerId, events);
+      return this.emit(events);
+    }
+
     // Kiểm tra quyền của người đang tới lượt
     const activePlayer = this.getActivePlayer();
     if (!activePlayer || activePlayer.id !== playerId) return this.emit(events);
@@ -111,7 +238,16 @@ export class GameEngine {
         this.handleJailUseCard(activePlayer, events);
         break;
       case 'ROLL_DICE':
-        this.handleRollDice(activePlayer, events);
+        this.handleRollDice(activePlayer, events, payload);
+        break;
+      case 'TRANSIT_TELEPORT':
+        this.handleTransitTeleport(activePlayer, payload.targetIndex, events);
+        break;
+      case 'USE_SPEED_BUS':
+        this.handleUseSpeedBus(activePlayer, payload.targetIndex, events);
+        break;
+      case 'SKIP_SPEED_BUS':
+        this.handleSkipSpeedBus(activePlayer, events);
         break;
       case 'BUY_PROPERTY':
         this.handleBuyProperty(activePlayer, events);
@@ -148,7 +284,6 @@ export class GameEngine {
   // ==================== VÒNG LẶP LƯỢT CHƠI ====================
 
   enterTurnStart() {
-    // Kiểm tra hết giờ ở chế độ SPEED (45 phút)
     if (this.state.mode === 'SPEED' && this.state.startedAt && Date.now() - this.state.startedAt >= 45 * 60 * 1000) {
       this.finishGameByNetWorth('Hết 45 phút thi đấu!');
       return;
@@ -156,13 +291,15 @@ export class GameEngine {
 
     const player = this.getActivePlayer();
     this.state.escapedJailByDouble = false;
+    this.state.pendingSpeedAction = null;
+    this.state.busTargets = null;
 
     if (player.inJail) {
       this.state.phase = 'JAIL_DECISION';
-      this.log(`🔒 Lượt của ${player.name} (Đang ở Nhà Tù Côn Đảo - Lượt ${player.jailTurns + 1}/3).`);
+      this.log(`🔒 Lượt của ${player.name} (Nhà Tù Côn Đảo - Lượt ${player.jailTurns + 1}/3).`);
     } else {
       this.state.phase = 'ROLL_DICE';
-      this.log(`🎯 Đến lượt của ${player.name}.`);
+      this.log(`🎯 Đến lượt của ${player.name} (Vòng ${this.state.roundCount}).`);
     }
   }
 
@@ -184,34 +321,37 @@ export class GameEngine {
     this.log(`🎫 ${player.name} sử dụng Thẻ Ân Xá để ra tù miễn phí.`);
   }
 
-  handleRollDice(player, events) {
+  handleRollDice(player, events, options = {}) {
     if (this.state.phase !== 'ROLL_DICE' && this.state.phase !== 'JAIL_DECISION') return;
 
-    const d1 = Math.floor(Math.random() * 6) + 1;
-    const d2 = Math.floor(Math.random() * 6) + 1;
-    const sum = d1 + d2;
+    const d1 = options.forceDice?.[0] ?? (Math.floor(Math.random() * 6) + 1);
+    const d2 = options.forceDice?.[1] ?? (Math.floor(Math.random() * 6) + 1);
+    const baseSum = d1 + d2;
     const isDouble = d1 === d2;
 
     this.state.dice = [d1, d2];
-    events.push({ type: 'DICE_ROLLED', playerId: player.id, dice: [d1, d2] });
-    this.log(`🎲 ${player.name} đổ xúc xắc: ${d1} - ${d2} (${sum} nút)${isDouble ? ' [ĐÔI!]' : ''}.`);
 
-    // Xử lý đổ xúc xắc khi đang trong Tù
+    // Xử lý đổ xúc xắc khi đang trong Tù (chỉ dùng 2 viên tiêu chuẩn)
     if (this.state.phase === 'JAIL_DECISION' && player.inJail) {
+      this.state.speedDie = null;
+      this.state.pendingSpeedAction = null;
+      events.push({ type: 'DICE_ROLLED', playerId: player.id, dice: [d1, d2], speedDie: null });
+      this.log(`🎲 ${player.name} đổ xúc xắc trong tù: ${d1} - ${d2} (${baseSum})${isDouble ? ' [ĐÔI!]' : ''}.`);
+
       if (isDouble) {
         player.inJail = false;
         player.jailTurns = 0;
-        this.state.escapedJailByDouble = true; // Không được đổ thêm lượt tiếp theo
+        this.state.escapedJailByDouble = true;
         this.log(`🔓 ${player.name} đổ ra đôi và thoát tù thành công!`);
-        this.movePlayerSteps(player, sum, events);
+        this.movePlayerSteps(player, baseSum, events);
       } else {
         player.jailTurns += 1;
         if (player.jailTurns >= GAME_CONSTANTS.MAX_JAIL_TURNS) {
-          this.log(`⏳ Đã hết 3 lượt ở tù! ${player.name} bắt buộc nộp phạt 50K và đi ${sum} bước.`);
+          this.log(`⏳ Đã hết 3 lượt ở tù! ${player.name} nộp phạt 50K và đi ${baseSum} bước.`);
           player.inJail = false;
           player.jailTurns = 0;
           this.adjustCash(player, -GAME_CONSTANTS.JAIL_FINE, 'BANK', events);
-          this.movePlayerSteps(player, sum, events);
+          this.movePlayerSteps(player, baseSum, events);
         } else {
           this.log(`⛓️ Chưa đổ ra đôi (${player.jailTurns}/3). ${player.name} tiếp tục ở lại tù.`);
           this.enterPostResolutionPhase(player, events);
@@ -220,11 +360,42 @@ export class GameEngine {
       return;
     }
 
-    // Đổ xúc xắc bình thường ngoài Tù
+    // Xúc xắc Tốc độ thứ 3 (Kích hoạt từ Vòng 2 trở đi trên bàn cờ Mở Rộng 52 Ô)
+    let speedFace = null;
+    let extraSteps = 0;
+    this.state.pendingSpeedAction = null;
+
+    if (this.state.boardPreset === 'MEGA_52' && this.state.roundCount >= 2) {
+      speedFace = options.forceSpeedDie !== undefined
+        ? options.forceSpeedDie
+        : SPEED_DIE_FACES[Math.floor(Math.random() * SPEED_DIE_FACES.length)];
+      this.state.speedDie = speedFace;
+      if (typeof speedFace === 'number') {
+        extraSteps = speedFace;
+      } else if (speedFace === 'BUS' || speedFace === 'MR_MONOPOLY') {
+        this.state.pendingSpeedAction = speedFace;
+      }
+    } else {
+      this.state.speedDie = null;
+    }
+
+    const totalSteps = baseSum + extraSteps;
+    events.push({ type: 'DICE_ROLLED', playerId: player.id, dice: [d1, d2], speedDie: speedFace });
+
+    const speedLabel = speedFace === null
+      ? ''
+      : typeof speedFace === 'number'
+        ? ` + ⚡${speedFace}`
+        : speedFace === 'BUS'
+          ? ' + [🚌 Xe Buýt]'
+          : ' + [🎩 Tỷ Phú]';
+    this.log(`🎲 ${player.name} đổ: ${d1} + ${d2}${speedLabel} = ${totalSteps} bước${isDouble ? ' [ĐÔI!]' : ''}.`);
+
     if (isDouble) {
       this.state.doubleCount += 1;
       if (this.state.doubleCount >= 3) {
-        this.log(`🚓 ${player.name} đổ đôi 3 lần liên tiếp (Vượt tốc độ) -> Vào Tù ngay lập tức!`);
+        this.state.pendingSpeedAction = null;
+        this.log(`🚓 ${player.name} đổ đôi 3 lần liên tiếp -> Vào Nhà Tù Côn Đảo ngay lập tức!`);
         this.sendToJail(player, events);
         return;
       }
@@ -232,27 +403,99 @@ export class GameEngine {
       this.state.doubleCount = 0;
     }
 
-    this.movePlayerSteps(player, sum, events);
+    this.movePlayerSteps(player, totalSteps, events);
+  }
+
+  // Đặc quyền Dịch chuyển Nhanh giữa các Trạm Giao Thông trên bàn cờ 52 Ô
+  handleTransitTeleport(player, targetIndex, events) {
+    const transit = getTransitTeleportInfo(this.state, player.id);
+    if (!transit) return;
+
+    const dest = transit.destinations.find(d => d.index === Number(targetIndex));
+    if (!dest) return;
+
+    if (transit.fee > 0 && transit.ticketReceiverId) {
+      const stationOwner = this.getPlayerById(transit.ticketReceiverId);
+      this.adjustCash(player, -transit.fee, transit.ticketReceiverId, events);
+      if (stationOwner) {
+        this.adjustCash(stationOwner, transit.fee, null, events);
+      }
+      this.log(`🎫 ${player.name} mua vé chuyển tuyến -${transit.fee}K cho ${stationOwner?.name || 'chủ trạm'}.`);
+    }
+
+    this.state.doubleCount = 0;
+    this.state.speedDie = null;
+    this.state.pendingSpeedAction = null;
+
+    const from = player.position;
+    player.position = dest.index;
+    events.push({ type: 'PLAYER_MOVED', playerId: player.id, from, to: dest.index, passedStart: false });
+    this.log(`🚇 ${player.name} chuyển tuyến tốc hành thẳng tới ${dest.name} (#${dest.index})!`);
+    this.resolveTile(player, dest, events);
+  }
+
+  // Lựa chọn của Xúc xắc Tốc độ mặt Xe Buýt Nhanh (BUS_DECISION)
+  findNextTileOfTypes(fromIndex, types) {
+    const B = this.getBoardSize();
+    for (let step = 1; step < B; step++) {
+      const idx = (fromIndex + step) % B;
+      if (types.includes(this.state.board[idx].type)) return idx;
+    }
+    return null;
+  }
+
+  handleUseSpeedBus(player, targetIndex, events) {
+    if (this.state.phase !== 'BUS_DECISION' || !this.state.busTargets) return;
+    const validTargets = [this.state.busTargets.cardIndex, this.state.busTargets.stationIndex].filter(v => v !== null);
+    const chosen = Number(targetIndex);
+    if (!validTargets.includes(chosen)) return;
+
+    this.state.busTargets = null;
+    const tile = this.state.board[chosen];
+    this.log(`🚌 ${player.name} bắt Xe Buýt Nhanh tiến thẳng tới ${tile.name} (#${chosen})!`);
+    this.movePlayerToIndex(player, chosen, true, events);
+  }
+
+  handleSkipSpeedBus(player, events) {
+    if (this.state.phase !== 'BUS_DECISION') return;
+    this.state.busTargets = null;
+    this.log(`🚏 ${player.name} chọn xuống xe đứng yên tại chỗ.`);
+    this.enterPostResolutionPhase(player, events);
+  }
+
+  awardStartBonus(player, landedExactOnStart, events) {
+    if (this.state.boardPreset === 'MEGA_52') {
+      const bonus = landedExactOnStart ? MEGA_52_CONSTANTS.SALARY_EXACT : MEGA_52_CONSTANTS.SALARY_PASS;
+      this.log(
+        landedExactOnStart
+          ? `🏁 ${player.name} dừng chính xác trên ô Khởi Hành, nhận thưởng lớn +${bonus}K!`
+          : `🏁 ${player.name} đi qua ô Khởi Hành, nhận lương +${bonus}K.`
+      );
+      this.adjustCash(player, bonus, null, events);
+    } else {
+      this.log(`🏁 ${player.name} đi qua ô Khởi Hành, nhận lương +${GAME_CONSTANTS.SALARY}K.`);
+      this.adjustCash(player, GAME_CONSTANTS.SALARY, null, events);
+    }
   }
 
   movePlayerSteps(player, steps, events) {
+    const B = this.getBoardSize();
     const from = player.position;
     let rawPos = from + steps;
     let passedStart = false;
 
-    if (steps > 0 && rawPos >= 40) {
+    if (steps > 0 && rawPos >= B) {
       passedStart = true;
-      rawPos = rawPos % 40;
+      rawPos = rawPos % B;
     } else if (rawPos < 0) {
-      rawPos = (rawPos + 40) % 40;
+      rawPos = (rawPos + B) % B;
     }
 
     player.position = rawPos;
     events.push({ type: 'PLAYER_MOVED', playerId: player.id, from, to: rawPos, passedStart });
 
     if (passedStart) {
-      this.log(`🏁 ${player.name} đi qua ô Khởi Hành, nhận lương +${GAME_CONSTANTS.SALARY}K.`);
-      this.adjustCash(player, GAME_CONSTANTS.SALARY, null, events);
+      this.awardStartBonus(player, rawPos === 0, events);
     }
 
     this.resolveTile(player, this.state.board[rawPos], events);
@@ -265,21 +508,23 @@ export class GameEngine {
     events.push({ type: 'PLAYER_MOVED', playerId: player.id, from, to: targetIndex, passedStart });
 
     if (passedStart) {
-      this.log(`🏁 ${player.name} qua vạch Xuất Phát, nhận +${GAME_CONSTANTS.SALARY}K.`);
-      this.adjustCash(player, GAME_CONSTANTS.SALARY, null, events);
+      this.awardStartBonus(player, targetIndex === 0, events);
     }
 
     this.resolveTile(player, this.state.board[targetIndex], events);
   }
 
   sendToJail(player, events) {
+    const jailIdx = this.getJailIndex();
     const from = player.position;
-    player.position = 10;
+    player.position = jailIdx;
     player.inJail = true;
     player.jailTurns = 0;
     this.state.doubleCount = 0;
-    events.push({ type: 'PLAYER_JAILED', playerId: player.id, from, to: 10 });
-    // Vào tù kết thúc lượt ngay lập tức (nếu đang không âm tiền)
+    this.state.pendingSpeedAction = null;
+    this.state.busTargets = null;
+    events.push({ type: 'PLAYER_JAILED', playerId: player.id, from, to: jailIdx });
+
     if (player.cash < 0) {
       this.state.phase = 'BANKRUPTCY_CHECK';
     } else {
@@ -293,9 +538,33 @@ export class GameEngine {
     switch (tile.type) {
       case 'START':
       case 'JAIL':
-      case 'FREE_PARKING':
         this.enterPostResolutionPhase(player, events);
         break;
+
+      case 'FREE_PARKING':
+        if (this.state.boardPreset === 'MEGA_52' && this.state.festivalFund > 0) {
+          const reward = this.state.festivalFund;
+          this.state.festivalFund = 0;
+          this.log(`⛲ ${player.name} dừng tại Phố Đi Bộ và trúng Quỹ Lễ Hội +${reward}K!`);
+          this.adjustCash(player, reward, null, events);
+        }
+        this.enterPostResolutionPhase(player, events);
+        break;
+
+      case 'NATIONAL_AUCTION': {
+        const unowned = this.state.board.filter(
+          t => !t.ownerId && (t.type === 'PROPERTY' || t.type === 'STATION' || t.type === 'UTILITY')
+        );
+        if (unowned.length > 0) {
+          const picked = unowned[Math.floor(Math.random() * unowned.length)];
+          this.log(`🔨 Sàn Đấu Giá Quốc Gia rút lô đất ${picked.name} (#${picked.index}) ra đấu giá công khai!`);
+          this.startAuction(picked.index);
+        } else {
+          this.log(`🔨 Sàn Đấu Giá Quốc Gia: Mọi lô đất trên bàn cờ đều đã có chủ!`);
+          this.enterPostResolutionPhase(player, events);
+        }
+        break;
+      }
 
       case 'GO_TO_JAIL':
         this.log(`🚨 ${player.name} dừng tại ô VÀO TÙ!`);
@@ -304,6 +573,9 @@ export class GameEngine {
 
       case 'TAX':
         this.log(`🏛️ ${player.name} nộp ${tile.name}: -${tile.taxAmount}K.`);
+        if (this.state.boardPreset === 'MEGA_52') {
+          this.state.festivalFund += tile.taxAmount;
+        }
         this.adjustCash(player, -tile.taxAmount, 'BANK', events);
         this.enterPostResolutionPhase(player, events);
         break;
@@ -341,35 +613,47 @@ export class GameEngine {
     const owner = this.getPlayerById(tile.ownerId);
     if (!owner || owner.isBankrupt) return;
 
+    // Quyền lợi Liên minh 2v2v2: Miễn 100% tiền thuê khi đi vào đất của đồng đội
+    if (areTeammates(this.state, owner.id, player.id)) {
+      this.log(`🤝 ${tile.name} thuộc đồng đội Liên minh (${owner.name}) -> ${player.name} được miễn 100% tiền thuê!`);
+      return;
+    }
+
     let rentAmount = 0;
 
     if (tile.type === 'PROPERTY') {
       if (tile.level === 0) {
         rentAmount = tile.rent[0];
-        if (this.ownsFullGroupUnmortgaged(owner.id, tile.group)) {
-          rentAmount *= 2; // Nhân đôi tiền thuê đất trống khi độc quyền nhóm màu
+        if (ownsFullGroupUnmortgaged(this.state, owner.id, tile.group)) {
+          rentAmount *= 2;
         }
       } else {
-        rentAmount = tile.rent[tile.level];
+        rentAmount = tile.rent[tile.level] ?? tile.rent[tile.rent.length - 1];
       }
     } else if (tile.type === 'STATION') {
       const ownedStations = this.state.board.filter(
-        t => t.type === 'STATION' && t.ownerId === owner.id && !t.isMortgaged
+        t => t.type === 'STATION' &&
+          (t.ownerId === owner.id || areTeammates(this.state, t.ownerId, owner.id)) &&
+          !t.isMortgaged
       ).length;
-      rentAmount = 25 * Math.pow(2, Math.max(0, ownedStations - 1));
+      rentAmount = getStationRentByCount(ownedStations);
     } else if (tile.type === 'UTILITY') {
       if (specialContext.utilityMultiplier) {
         const d1 = Math.floor(Math.random() * 6) + 1;
         const d2 = Math.floor(Math.random() * 6) + 1;
         this.state.dice = [d1, d2];
-        events.push({ type: 'DICE_ROLLED', playerId: player.id, dice: [d1, d2] });
+        events.push({ type: 'DICE_ROLLED', playerId: player.id, dice: [d1, d2], speedDie: null });
         rentAmount = (d1 + d2) * specialContext.utilityMultiplier;
       } else {
         const ownedUtils = this.state.board.filter(
-          t => t.type === 'UTILITY' && t.ownerId === owner.id && !t.isMortgaged
+          t => t.type === 'UTILITY' &&
+            (t.ownerId === owner.id || areTeammates(this.state, t.ownerId, owner.id)) &&
+            !t.isMortgaged
         ).length;
-        const diceSum = this.state.dice[0] + this.state.dice[1];
-        rentAmount = diceSum * (ownedUtils >= 2 ? 10 : 4);
+        const mult = getUtilityMultiplierByCount(ownedUtils);
+        const speedNum = typeof this.state.speedDie === 'number' ? this.state.speedDie : 0;
+        const diceSum = this.state.dice[0] + this.state.dice[1] + speedNum;
+        rentAmount = diceSum * mult;
       }
     }
 
@@ -396,7 +680,7 @@ export class GameEngine {
     const tile = this.state.board[player.position];
     if (!tile || tile.ownerId) return;
 
-    this.log(`🔨 ${player.name} từ chối mua ${tile.name}. Chuyển sang Đấu Giá công khai!`);
+    this.log(`🔨 ${player.name} từ chối mua ${tile.name}. Mở phiên Đấu Giá công khai!`);
     this.startAuction(tile.index);
   }
 
@@ -447,7 +731,6 @@ export class GameEngine {
     auction.expiresAt = Date.now() + GAME_CONSTANTS.AUCTION_TIMER_SECONDS * 1000;
     this.log(`🙋 ${bidder.name} trả giá ${amount}K!`);
 
-    // Kiểm tra nếu tất cả người khác đã bỏ cuộc thì chốt luôn
     const activeBidders = this.getAlivePlayers().filter(p => !auction.foldedIds.includes(p.id));
     if (activeBidders.length <= 1 && auction.highestBidderId) {
       this.finalizeAuction(events);
@@ -487,7 +770,6 @@ export class GameEngine {
 
     this.state.auction = null;
 
-    // Nếu còn hàng đợi đấu giá (từ người chơi phá sản cho Ngân hàng)
     if (this.state.auctionQueue.length > 0) {
       const nextTileIndex = this.state.auctionQueue.shift();
       this.startAuction(nextTileIndex);
@@ -504,6 +786,20 @@ export class GameEngine {
 
   // ==================== THẺ CƠ HỘI & KHÍ VẬN ====================
 
+  resolveCardTargetIndex(card) {
+    if (this.state.boardPreset !== 'MEGA_52') {
+      return card.payload.targetIndex;
+    }
+    // Ánh xạ chính xác địa danh tương ứng trên bàn cờ 52 Ô
+    const map40To52 = {
+      0: 0,   // Khởi Hành
+      15: 21, // Ga Đà Nẵng
+      29: 47, // Đảo Phú Quốc
+      39: 51  // Phố Đi Bộ Nguyễn Huệ
+    };
+    return map40To52[card.payload.targetIndex] ?? card.payload.targetIndex;
+  }
+
   drawCard(player, deckType, events) {
     const deck = deckType === 'CHANCE' ? this.chanceDeck : this.communityDeck;
     if (deck.length === 0) {
@@ -517,7 +813,6 @@ export class GameEngine {
     events.push({ type: 'CARD_DRAWN', playerId: player.id, deck: deckType, card });
     this.log(`🃏 ${player.name} rút thẻ ${deckType === 'CHANCE' ? 'Cơ Hội' : 'Khí Vận'}: "${card.text}"`);
 
-    // Nếu không phải thẻ giữ lại thì xếp xuống đáy bộ bài
     if (card.action !== 'JAIL_FREE_CARD') {
       deck.push(card);
     }
@@ -529,29 +824,34 @@ export class GameEngine {
         break;
 
       case 'DEDUCT_CASH':
+        if (this.state.boardPreset === 'MEGA_52') {
+          this.state.festivalFund += card.payload.amount;
+        }
         this.adjustCash(player, -card.payload.amount, 'BANK', events);
         this.enterPostResolutionPhase(player, events);
         break;
 
-      case 'MOVE_TO':
-        this.movePlayerToIndex(player, card.payload.targetIndex, card.payload.collectSalary, events);
+      case 'MOVE_TO': {
+        const destIdx = this.resolveCardTargetIndex(card);
+        this.movePlayerToIndex(player, destIdx, card.payload.collectSalary, events);
         break;
+      }
 
       case 'MOVE_STEPS':
         this.movePlayerSteps(player, card.payload.steps, events);
         break;
 
       case 'NEAREST_UTILITY': {
-        const target = (player.position >= 12 && player.position < 28) ? 28 : 12;
+        const target = this.findNextTileOfTypes(player.position, ['UTILITY']) ?? 12;
         const passedStart = target < player.position;
         const from = player.position;
         player.position = target;
         events.push({ type: 'PLAYER_MOVED', playerId: player.id, from, to: target, passedStart });
         if (passedStart) {
-          this.adjustCash(player, GAME_CONSTANTS.SALARY, null, events);
+          this.awardStartBonus(player, target === 0, events);
         }
         const utilTile = this.state.board[target];
-        if (utilTile.ownerId && utilTile.ownerId !== player.id) {
+        if (utilTile.ownerId && utilTile.ownerId !== player.id && !areTeammates(this.state, utilTile.ownerId, player.id)) {
           this.collectRent(player, utilTile, events, { utilityMultiplier: card.payload.multiplier });
           this.enterPostResolutionPhase(player, events);
         } else {
@@ -568,11 +868,14 @@ export class GameEngine {
         let totalCost = 0;
         for (const t of this.state.board) {
           if (t.ownerId === player.id && t.level > 0) {
-            totalCost += t.level === 5 ? card.payload.hotelCost : t.level * card.payload.houseCost;
+            totalCost += t.level >= 5 ? card.payload.hotelCost : t.level * card.payload.houseCost;
           }
         }
         this.log(`🛠️ Chi phí sửa chữa công trình của ${player.name}: -${totalCost}K.`);
-        if (totalCost > 0) this.adjustCash(player, -totalCost, 'BANK', events);
+        if (totalCost > 0) {
+          if (this.state.boardPreset === 'MEGA_52') this.state.festivalFund += totalCost;
+          this.adjustCash(player, -totalCost, 'BANK', events);
+        }
         this.enterPostResolutionPhase(player, events);
         break;
       }
@@ -605,23 +908,14 @@ export class GameEngine {
     }
   }
 
-  // ==================== XÂY DỰNG ĐỒNG ĐỀU, THẾ CHẤP & GIAO DỊCH ====================
+  // ==================== XÂY DỰNG LINH HOẠT, LANDMARK CẤP 6, THẾ CHẤP & GIAO DỊCH ====================
 
   ownsFullGroupUnmortgaged(playerId, group) {
-    const groupTiles = this.state.board.filter(t => t.group === group);
-    return groupTiles.length > 0 && groupTiles.every(t => t.ownerId === playerId && !t.isMortgaged);
+    return ownsFullGroupUnmortgaged(this.state, playerId, group);
   }
 
   canBuildHouse(playerId, tileIndex) {
-    const tile = this.state.board[tileIndex];
-    const player = this.getPlayerById(playerId);
-    if (!tile || !player || tile.type !== 'PROPERTY' || tile.ownerId !== playerId) return false;
-    if (tile.level >= 5 || player.cash < tile.buildCost) return false;
-    if (!this.ownsFullGroupUnmortgaged(playerId, tile.group)) return false;
-
-    // Quy tắc xây đồng đều: mọi ô khác trong nhóm phải có level >= tile.level
-    const groupTiles = this.state.board.filter(t => t.group === tile.group);
-    return groupTiles.every(t => t.level >= tile.level);
+    return canBuildHouseState(this.state, playerId, tileIndex);
   }
 
   handleBuildHouse(player, tileIndex, events) {
@@ -631,18 +925,16 @@ export class GameEngine {
     const tile = this.state.board[tileIndex];
     this.adjustCash(player, -tile.buildCost, 'BANK', events);
     tile.level += 1;
-    const label = tile.level === 5 ? 'Khách Sạn' : `Nhà cấp ${tile.level}`;
-    this.log(`🏗️ ${player.name} nâng cấp ${label} tại ${tile.name} (-${tile.buildCost}K).`);
+    const label = tile.level === 6
+      ? 'Siêu Quần Thể Landmark 🏙️'
+      : tile.level === 5
+        ? 'Khách Sạn 5 Sao 🏨'
+        : `Nhà phố cấp ${tile.level} 🏠`;
+    this.log(`🏗️ ${player.name} dựng ${label} tại ${tile.name} (-${tile.buildCost}K).`);
   }
 
   canSellHouse(playerId, tileIndex) {
-    const tile = this.state.board[tileIndex];
-    if (!tile || tile.type !== 'PROPERTY' || tile.ownerId !== playerId || tile.level <= 0) return false;
-
-    // Quy tắc bán đồng đều: chỉ bán ở ô đang có số nhà cao nhất trong nhóm
-    const groupTiles = this.state.board.filter(t => t.group === tile.group);
-    const maxLevel = Math.max(...groupTiles.map(t => t.level));
-    return tile.level === maxLevel;
+    return canSellHouseState(this.state, playerId, tileIndex);
   }
 
   handleSellHouse(player, tileIndex, events) {
@@ -653,18 +945,12 @@ export class GameEngine {
     const refund = Math.floor(tile.buildCost * 0.5);
     tile.level -= 1;
     this.adjustCash(player, refund, null, events);
-    this.log(`🏚️ ${player.name} bán 1 cấp nhà tại ${tile.name}, thu về +${refund}K.`);
+    this.log(`🏚️ ${player.name} bán 1 cấp công trình tại ${tile.name}, thu về +${refund}K.`);
     this.recheckDebtRecovery(player);
   }
 
   canMortgageTile(playerId, tileIndex) {
-    const tile = this.state.board[tileIndex];
-    if (!tile || tile.ownerId !== playerId || tile.isMortgaged || !tile.mortgageValue) return false;
-    if (tile.type === 'PROPERTY') {
-      const groupTiles = this.state.board.filter(t => t.group === tile.group);
-      if (groupTiles.some(t => t.level > 0)) return false; // Toàn bộ nhóm phải không còn nhà
-    }
-    return true;
+    return canMortgageTileState(this.state, playerId, tileIndex);
   }
 
   handleMortgage(player, tileIndex, events) {
@@ -691,15 +977,8 @@ export class GameEngine {
     this.log(`🔓 ${player.name} chuộc lại ${tile.name} với giá ${cost}K.`);
   }
 
-  // Kiểm tra lô đất có được phép giao dịch không (cả nhóm màu phải không có nhà)
   isTileTradable(ownerId, tileIndex) {
-    const tile = this.state.board[tileIndex];
-    if (!tile || tile.ownerId !== ownerId) return false;
-    if (tile.type === 'PROPERTY') {
-      const groupTiles = this.state.board.filter(t => t.group === tile.group);
-      if (groupTiles.some(t => t.level > 0)) return false;
-    }
-    return true;
+    return isTileTradableState(this.state, ownerId, tileIndex);
   }
 
   handleCreateTrade(fromPlayer, payload, events) {
@@ -745,7 +1024,6 @@ export class GameEngine {
       return;
     }
 
-    // Chuyển tiền & thẻ Ra Tù
     if (trade.offerCash > 0) {
       this.adjustCash(fromP, -trade.offerCash, toP.id, events);
       this.adjustCash(toP, trade.offerCash, null, events);
@@ -757,7 +1035,6 @@ export class GameEngine {
     fromP.jailFreeCards = fromP.jailFreeCards - trade.offerJailCards + trade.requestJailCards;
     toP.jailFreeCards = toP.jailFreeCards - trade.requestJailCards + trade.offerJailCards;
 
-    // Chuyển quyền sở hữu đất và thu ngay 10% phí chuyển nhượng nếu đất đang thế chấp
     const transferTile = (tileIdx, newOwner) => {
       const tile = this.state.board[tileIdx];
       tile.ownerId = newOwner.id;
@@ -791,7 +1068,24 @@ export class GameEngine {
     this.state.pendingMortgageTransfers.splice(idx, 1);
   }
 
-  // ==================== NỢ, THANH LÝ & PHÁ SẢN ====================
+  // ==================== CỨU TRỢ LIÊN MINH, NỢ & PHÁ SẢN ====================
+
+  handleAllyBailout(callerId, events) {
+    const active = this.getActivePlayer();
+    if (!active) return;
+    const bailout = getAllyBailoutInfo(this.state, active.id);
+    if (!bailout) return;
+    if (callerId !== bailout.debtorId && callerId !== bailout.allyId) return;
+
+    const ally = this.getPlayerById(bailout.allyId);
+    if (!ally) return;
+
+    ally.usedBailout = true;
+    this.adjustCash(ally, -bailout.amount, 'BANK', events);
+    this.adjustCash(active, bailout.amount, null, events);
+    this.log(`🤝 CỨU TRỢ LIÊN MINH! ${ally.name} chuyển khoản ${bailout.amount}K giải cứu đồng đội ${active.name}!`);
+    this.recheckDebtRecovery(active);
+  }
 
   calculateMaxRecoverableCash(player) {
     let recoverable = player.cash;
@@ -805,22 +1099,81 @@ export class GameEngine {
         }
       }
     }
+    // Nếu đồng đội Liên minh có thể cứu trợ thì vẫn còn cơ hội phục hồi
+    const bailout = getAllyBailoutInfo({ ...this.state, phase: 'BANKRUPTCY_CHECK' }, player.id);
+    if (bailout) {
+      recoverable += bailout.amount;
+    }
     return recoverable;
+  }
+
+  findMrMonopolyTarget(fromIndex, playerId) {
+    const B = this.getBoardSize();
+    const isPurchasable = (t) => t.type === 'PROPERTY' || t.type === 'STATION' || t.type === 'UTILITY';
+
+    // 1. Ưu tiên ô đất trống chưa có chủ gần nhất phía trước
+    for (let step = 1; step <= B; step++) {
+      const idx = (fromIndex + step) % B;
+      const t = this.state.board[idx];
+      if (isPurchasable(t) && !t.ownerId) return t;
+    }
+
+    // 2. Nếu toàn bộ đất đã có chủ -> Bay tới ô đất có chủ thu thuê gần nhất phía trước
+    for (let step = 1; step <= B; step++) {
+      const idx = (fromIndex + step) % B;
+      const t = this.state.board[idx];
+      if (
+        isPurchasable(t) &&
+        t.ownerId &&
+        t.ownerId !== playerId &&
+        !areTeammates(this.state, t.ownerId, playerId) &&
+        !t.isMortgaged
+      ) {
+        return t;
+      }
+    }
+    return null;
   }
 
   enterPostResolutionPhase(player, events) {
     if (player.cash < 0) {
+      this.state.pendingSpeedAction = null;
+      this.state.busTargets = null;
       const maxRecoverable = this.calculateMaxRecoverableCash(player);
       if (maxRecoverable < 0) {
         this.declareBankruptcy(player, this.state.pendingDebtCreditor || 'BANK', events);
       } else {
         this.state.phase = 'BANKRUPTCY_CHECK';
-        this.log(`⚠️ ${player.name} đang âm tiền (${player.cash}K)! Cần bán nhà hoặc thế chấp tài sản để trả nợ.`);
+        this.log(`⚠️ ${player.name} đang âm tiền (${player.cash}K)! Cần bán nhà, thế chấp hoặc nhận Cứu trợ Liên minh.`);
       }
-    } else {
-      this.state.pendingDebtCreditor = null;
-      this.state.phase = 'MANAGEMENT_PHASE';
+      return;
     }
+
+    this.state.pendingDebtCreditor = null;
+
+    // Kích hoạt hiệu ứng đặc biệt của Xúc xắc Tốc độ (nếu có) sau khi xong ô đầu tiên
+    if (!player.inJail && !player.isBankrupt && this.state.pendingSpeedAction) {
+      const speedAct = this.state.pendingSpeedAction;
+      this.state.pendingSpeedAction = null;
+
+      if (speedAct === 'MR_MONOPOLY') {
+        const targetTile = this.findMrMonopolyTarget(player.position, player.id);
+        if (targetTile && targetTile.index !== player.position) {
+          this.log(`🎩 Xúc xắc Tỷ Phú! ${player.name} tự động tiến thẳng tới ${targetTile.name} (#${targetTile.index})!`);
+          this.movePlayerToIndex(player, targetTile.index, true, events);
+          return;
+        }
+      } else if (speedAct === 'BUS') {
+        const cardIndex = this.findNextTileOfTypes(player.position, ['CHANCE', 'COMMUNITY_CHEST']);
+        const stationIndex = this.findNextTileOfTypes(player.position, ['STATION']);
+        this.state.busTargets = { cardIndex, stationIndex };
+        this.state.phase = 'BUS_DECISION';
+        this.log(`🚌 Xe Buýt Nhanh! ${player.name} được quyền đi tiếp tới Ô Thẻ / Trạm Giao Thông hoặc đứng yên.`);
+        return;
+      }
+    }
+
+    this.state.phase = 'MANAGEMENT_PHASE';
   }
 
   recheckDebtRecovery(player) {
@@ -834,8 +1187,9 @@ export class GameEngine {
   declareBankruptcy(player, creditorId, events) {
     this.log(`💥 ${player.name} CHÍNH THỨC PHÁ SẢN!`);
     player.isBankrupt = true;
+    this.state.pendingSpeedAction = null;
+    this.state.busTargets = null;
 
-    // 1. Tự động bán toàn bộ nhà/khách sạn về cho Ngân hàng
     for (const tile of this.state.board) {
       if (tile.ownerId === player.id && tile.level > 0) {
         const refund = tile.level * Math.floor(tile.buildCost * 0.5);
@@ -846,7 +1200,6 @@ export class GameEngine {
 
     const ownedTiles = this.state.board.filter(t => t.ownerId === player.id);
 
-    // 2. Xử lý theo Chủ nợ
     if (creditorId && creditorId !== 'BANK') {
       const creditor = this.getPlayerById(creditorId);
       if (creditor && !creditor.isBankrupt) {
@@ -854,12 +1207,11 @@ export class GameEngine {
         creditor.jailFreeCards += player.jailFreeCards;
         for (const tile of ownedTiles) {
           tile.ownerId = creditor.id;
-          tile.isMortgaged = true; // Chuyển giao dưới dạng đang thế chấp theo đặc tả
+          tile.isMortgaged = true;
         }
         this.log(`📦 Toàn bộ tài sản của ${player.name} được chuyển nhượng cho chủ nợ ${creditor.name}.`);
       }
     } else {
-      // Nợ Ngân hàng: thu hồi đất và đưa lần lượt vào Đấu Giá
       for (const tile of ownedTiles) {
         tile.ownerId = null;
         tile.isMortgaged = false;
@@ -871,7 +1223,6 @@ export class GameEngine {
     player.cash = 0;
     player.jailFreeCards = 0;
 
-    // 3. Kiểm tra điều kiện kết thúc ván đấu
     if (this.state.mode === 'SPEED') {
       this.clearAuctionTimer();
       this.state.auctionQueue = [];
@@ -880,7 +1231,21 @@ export class GameEngine {
     }
 
     const alive = this.getAlivePlayers();
-    if (alive.length <= 1) {
+
+    // Kiểm tra chiến thắng theo Liên Minh 2v2v2
+    if (this.state.allianceMode) {
+      const aliveTeams = [...new Set(alive.map(p => getAllianceForPlayer(p.id)?.id || p.id))];
+      if (aliveTeams.length <= 1) {
+        this.clearAuctionTimer();
+        this.state.auctionQueue = [];
+        this.state.phase = 'GAME_OVER';
+        const winTeam = ALLIANCE_TEAMS[aliveTeams[0]];
+        this.state.winningAlliance = winTeam?.id || null;
+        this.state.winnerId = alive[0]?.id || null;
+        this.log(`🏆 CHIẾN THẮNG LIÊN MINH! ${winTeam?.name || alive[0]?.name} thống trị toàn bộ bàn cờ!`);
+        return;
+      }
+    } else if (alive.length <= 1) {
       this.clearAuctionTimer();
       this.state.auctionQueue = [];
       this.state.phase = 'GAME_OVER';
@@ -889,14 +1254,57 @@ export class GameEngine {
       return;
     }
 
-    // Nếu có hàng đợi đấu giá đất thu hồi của Ngân hàng thì mở đấu giá ngay
-    if (this.state.auctionQueue.length > 0) {
+    const activePlayer = this.getActivePlayer();
+    const wasActive = activePlayer?.id === player.id;
+
+    if (this.state.auctionQueue.length > 0 && this.state.phase !== 'AUCTION_PHASE') {
       const firstTile = this.state.auctionQueue.shift();
       this.startAuction(firstTile);
       return;
     }
 
-    this.advanceToNextPlayer();
+    if (wasActive && this.state.phase !== 'AUCTION_PHASE') {
+      this.advanceToNextPlayer();
+    }
+  }
+
+  removeLobbyPlayer(targetId) {
+    if (this.state.phase !== 'LOBBY' || !targetId || targetId === 'P1') return;
+    const idx = this.state.players.findIndex(p => p.id === targetId);
+    if (idx === -1) return;
+    const [removed] = this.state.players.splice(idx, 1);
+    this.log(`👋 ${removed.name} đã rời khỏi phòng chờ.`);
+  }
+
+  handleLeaveRoom(playerId, events) {
+    const player = this.getPlayerById(playerId);
+    if (!player) return;
+
+    if (this.state.phase === 'LOBBY') {
+      this.removeLobbyPlayer(playerId);
+      return;
+    }
+
+    if (this.state.phase === 'GAME_OVER' || player.isBankrupt) return;
+
+    if (this.state.pendingTrade &&
+      (this.state.pendingTrade.fromPlayerId === playerId || this.state.pendingTrade.toPlayerId === playerId)) {
+      this.state.pendingTrade = null;
+    }
+
+    this.log(`🚪 ${player.name} đã rời khỏi phòng!`);
+
+    if (this.state.phase === 'AUCTION_PHASE' && this.state.auction) {
+      if (!this.state.auction.foldedIds.includes(playerId)) {
+        this.state.auction.foldedIds.push(playerId);
+      }
+      if (this.state.auction.highestBidderId === playerId) {
+        this.state.auction.highestBidderId = null;
+        this.state.auction.highestBid = 0;
+      }
+    }
+
+    this.declareBankruptcy(player, 'BANK', events);
   }
 
   handleEndTurn(player, events) {
@@ -914,10 +1322,17 @@ export class GameEngine {
   advanceToNextPlayer() {
     this.state.doubleCount = 0;
     this.state.escapedJailByDouble = false;
+    this.state.pendingSpeedAction = null;
+    this.state.busTargets = null;
+
     const total = this.state.players.length;
+    const prevIdx = this.state.activePlayerIndex;
     for (let step = 1; step <= total; step++) {
-      const nextIdx = (this.state.activePlayerIndex + step) % total;
+      const nextIdx = (prevIdx + step) % total;
       if (!this.state.players[nextIdx].isBankrupt) {
+        if (nextIdx <= prevIdx) {
+          this.state.roundCount += 1;
+        }
         this.state.activePlayerIndex = nextIdx;
         this.enterTurnStart();
         return;
@@ -930,24 +1345,31 @@ export class GameEngine {
   calculateNetWorth(playerId) {
     const player = this.getPlayerById(playerId);
     if (!player || player.isBankrupt) return -1;
-    let netWorth = player.cash;
-    for (const tile of this.state.board) {
-      if (tile.ownerId === playerId) {
-        if (tile.isMortgaged) {
-          netWorth += Math.floor((tile.price || 0) * 0.5);
-        } else {
-          netWorth += (tile.price || 0);
-        }
-        if (tile.level > 0 && tile.buildCost) {
-          netWorth += tile.level * tile.buildCost;
-        }
-      }
-    }
-    return netWorth;
+    return calculateNetWorthState(this.state, playerId);
   }
 
   finishGameByNetWorth(reason) {
     this.state.phase = 'GAME_OVER';
+
+    if (this.state.allianceMode) {
+      let bestTeam = null;
+      let bestTeamScore = -Infinity;
+      for (const team of Object.values(ALLIANCE_TEAMS)) {
+        const aliveMembers = this.getAlivePlayers().filter(p => team.members.includes(p.id));
+        if (aliveMembers.length === 0) continue;
+        const score = aliveMembers.reduce((sum, p) => sum + this.calculateNetWorth(p.id), 0);
+        if (score > bestTeamScore) {
+          bestTeamScore = score;
+          bestTeam = team;
+        }
+      }
+      this.state.winningAlliance = bestTeam?.id || null;
+      const topMember = this.getAlivePlayers().find(p => bestTeam?.members.includes(p.id));
+      this.state.winnerId = topMember?.id || null;
+      this.log(`⏱️ ${reason} ${bestTeam?.name || 'Liên minh dẫn đầu'} chiến thắng với Tổng tài sản ${bestTeamScore}K!`);
+      return;
+    }
+
     let bestPlayer = null;
     let bestScore = -Infinity;
 
@@ -990,7 +1412,7 @@ export class GameEngine {
 
   log(message) {
     this.state.logs.unshift(message);
-    if (this.state.logs.length > 60) this.state.logs.pop();
+    if (this.state.logs.length > 75) this.state.logs.pop();
   }
 
   getSnapshot() {

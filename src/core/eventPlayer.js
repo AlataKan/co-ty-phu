@@ -1,8 +1,8 @@
 let playbackChain = Promise.resolve();
 
-export function enqueueEventsAndRender(events, finalState, phaserBoardScene, uiManager) {
+export function enqueueEventsAndRender(events, finalState, boardScene, uiManager) {
   playbackChain = playbackChain
-    .then(() => playEventsAndRenderState(events, finalState, phaserBoardScene, uiManager))
+    .then(() => playEventsAndRenderState(events, finalState, boardScene, uiManager))
     .catch((err) => {
       console.error('[EventPlayer] Lỗi khi phát sự kiện:', err);
       uiManager.setInteractiveLock(false);
@@ -10,37 +10,57 @@ export function enqueueEventsAndRender(events, finalState, phaserBoardScene, uiM
   return playbackChain;
 }
 
-export async function playEventsAndRenderState(events, finalState, phaserBoardScene, uiManager) {
+export async function playEventsAndRenderState(events, finalState, boardScene, uiManager) {
+  let jailedPlayerId = null;
+  let rolledDice = finalState?.dice || [1, 1];
+  let rolledSpeedDie = finalState?.speedDie ?? null;
+  let hadCardModal = false;
+
   if (events && events.length > 0) {
     uiManager.setInteractiveLock(true);
 
     for (const ev of events) {
       switch (ev.type) {
         case 'DICE_ROLLED':
-          await phaserBoardScene.animateDiceRoll(ev.dice[0], ev.dice[1]);
+          rolledDice = ev.dice;
+          rolledSpeedDie = ev.speedDie ?? null;
+          uiManager.updateMiniDiceHUD(ev.dice[0], ev.dice[1], rolledSpeedDie);
+          await boardScene.animateDiceRoll(ev.dice[0], ev.dice[1], rolledSpeedDie);
           break;
 
         case 'PLAYER_MOVED':
-          await phaserBoardScene.animateTokenMove(ev.playerId, ev.from, ev.to, ev.passedStart);
+          uiManager.setInspectedTile(ev.to, false);
+          boardScene.setInspectedTile(ev.to);
+          await boardScene.animateTokenMove(ev.playerId, ev.from, ev.to, ev.passedStart);
           break;
 
         case 'PLAYER_JAILED':
-          await phaserBoardScene.animateTokenJail(ev.playerId, ev.to);
+          uiManager.setInspectedTile(ev.to, false);
+          boardScene.setInspectedTile(ev.to);
+          await boardScene.animateTokenJail(ev.playerId, ev.to);
+          jailedPlayerId = ev.playerId;
           break;
 
         case 'CASH_CHANGED':
-          phaserBoardScene.showFloatingText(ev.tileIndex, ev.amount);
-          await new Promise(r => setTimeout(r, 400));
+          boardScene.showFloatingText(ev.tileIndex, ev.amount);
+          await new Promise(r => setTimeout(r, 300));
           break;
 
         case 'CARD_DRAWN':
-          await uiManager.showChanceOrCommunityCardModal(ev.deck, ev.card);
+          hadCardModal = true;
+          await uiManager.showChanceOrCommunityCardModal(ev.deck, ev.card, ev.playerId, finalState, rolledDice, rolledSpeedDie);
           break;
       }
     }
   }
 
-  phaserBoardScene.syncBoardOwnersAndBuildings(finalState.board, finalState.players);
+  boardScene.syncBoardState(finalState, uiManager.getInspectedTileIndex(finalState));
+  await uiManager.onEventsBatchFinished(events || [], finalState, {
+    jailedPlayerId,
+    rolledDice,
+    rolledSpeedDie,
+    hadCardModal
+  });
   uiManager.renderHUD(finalState);
   uiManager.setInteractiveLock(false);
 }
