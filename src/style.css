@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Cho phép các phần tử con tương tác trong lớp phủ bật lại chuột */
+.ui-interactive {
+  pointer-events: auto;
+}
